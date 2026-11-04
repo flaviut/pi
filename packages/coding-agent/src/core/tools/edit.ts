@@ -5,12 +5,13 @@ import { splitBom } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import {
 	applyEditsToNormalizedContent,
-	detectLineEnding,
+	applyReplacementsToOriginal,
+	EDIT_DIFF_MAX_FILE_BYTES,
+	EDIT_DIFF_OMITTED_NOTICE,
 	type Edit,
 	generateDiffString,
 	generateUnifiedPatch,
 	normalizeToLF,
-	restoreLineEndings,
 } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
@@ -65,9 +66,9 @@ function isSingleEditInput(value: unknown): value is SingleEditInput {
 }
 
 export interface EditToolDetails {
-	/** Display-oriented diff of the changes made */
+	/** Display-oriented diff of the changes made, or a one-line notice for files larger than 5 MB */
 	diff: string;
-	/** Standard unified patch of the changes made */
+	/** Standard unified patch of the changes made; empty for files larger than 5 MB */
 	patch: string;
 	/** Line number of the first change in the new file (for editor navigation) */
 	firstChangedLine?: number;
@@ -186,17 +187,29 @@ export function createEditToolDefinition(
 
 				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 				const { bom, text: content } = splitBom(rawContent);
-				const originalEnding = detectLineEnding(content);
 				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				const { baseContent, newContent, replacements } = applyEditsToNormalizedContent(
+					normalizedContent,
+					edits,
+					path,
+				);
+				// Diff before writing, so diff computation cannot fail after the write.
+				const diffResult =
+					buffer.length > EDIT_DIFF_MAX_FILE_BYTES
+						? { diff: EDIT_DIFF_OMITTED_NOTICE, patch: "", firstChangedLine: undefined }
+						: {
+								...generateDiffString(baseContent, newContent),
+								patch: generateUnifiedPatch(path, baseContent, newContent),
+							};
 				throwIfAborted();
 
-				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+				// Splice into the original text, so untouched lines keep their line endings. Without any CR
+				// the original is the normalized text, and the normalized result is already final.
+				const finalContent =
+					bom + (content === normalizedContent ? newContent : applyReplacementsToOriginal(content, replacements));
 				await ops.writeFile(absolutePath, finalContent);
 				throwIfAborted();
 
-				const diffResult = generateDiffString(baseContent, newContent);
-				const patch = generateUnifiedPatch(path, baseContent, newContent);
 				return {
 					content: [
 						{
@@ -204,7 +217,7 @@ export function createEditToolDefinition(
 							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
 						},
 					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+					details: diffResult,
 				};
 			});
 		},

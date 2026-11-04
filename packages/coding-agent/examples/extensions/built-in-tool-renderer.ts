@@ -166,6 +166,11 @@ export default function (pi: ExtensionAPI) {
 				return new Text(theme.fg("success", "Applied"), 0, 0);
 			}
 
+			// Files larger than 5 MB get no diff: details.diff holds a one-line notice and the patch is empty.
+			if (details.patch === "") {
+				return new Text(theme.fg("success", "Applied") + theme.fg("dim", ", diff not shown"), 0, 0);
+			}
+
 			// Count additions and removals from the diff
 			const diffLines = details.diff.split("\n");
 			let additions = 0;

@@ -8,20 +8,63 @@ import { access, readFile } from "fs/promises";
 import { splitBom } from "../../utils/text.ts";
 import { resolveToCwd } from "./path-utils.ts";
 
-export function detectLineEnding(content: string): "\r\n" | "\n" {
-	const crlfIdx = content.indexOf("\r\n");
-	const lfIdx = content.indexOf("\n");
-	if (lfIdx === -1) return "\n";
-	if (crlfIdx === -1) return "\n";
-	return crlfIdx < lfIdx ? "\r\n" : "\n";
-}
-
 export function normalizeToLF(text: string): string {
 	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
-export function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string {
-	return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
+/**
+ * Apply replacements matched in `normalizeToLF(originalContent)` to `originalContent` itself.
+ * Text outside the replaced ranges keeps its bytes, including its line endings. Line breaks in
+ * the new text get the line ending of the line where the replaced range starts. The result,
+ * normalized to LF, equals the replacements applied to the normalized content.
+ */
+export function applyReplacementsToOriginal(originalContent: string, replacements: TextReplacement[]): string {
+	// Only CRLF changes length when normalizing: the LF of the n-th CRLF (at original offset p) is at
+	// p - n in the normalized text. Adding the number of CRLFs before a normalized offset gives the
+	// original offset, and a range that covers that LF covers the whole CRLF.
+	let crlfBefore = 0;
+	let nextCrlf = originalContent.indexOf("\r\n");
+	const toOriginal = (offset: number): number => {
+		while (nextCrlf !== -1 && nextCrlf - crlfBefore < offset) {
+			crlfBefore++;
+			nextCrlf = originalContent.indexOf("\r\n", nextCrlf + 2);
+		}
+		return offset + crlfBefore;
+	};
+
+	const parts: string[] = [];
+	let endsWithCr = false;
+	const push = (part: string): void => {
+		if (part.length === 0) return;
+		// A CR before a seam and an LF after it would merge into one CRLF line break, for example a kept
+		// lone CR followed by inserted text that starts with LF, or both sides of a deleted range. Adding
+		// an LF turns the CR into a CRLF of its own, so the written file has the line breaks the diff shows.
+		if (endsWithCr && part[0] === "\n") parts.push("\n");
+		parts.push(part);
+		endsWithCr = part[part.length - 1] === "\r";
+	};
+	let position = 0;
+	for (const replacement of replacements) {
+		const start = toOriginal(replacement.matchIndex);
+		push(originalContent.slice(position, start));
+		const ending = getLineEndingAt(originalContent, start);
+		push(ending === "\n" ? replacement.newText : replacement.newText.replaceAll("\n", ending));
+		position = toOriginal(replacement.matchIndex + replacement.matchLength);
+	}
+	push(originalContent.slice(position));
+	return parts.join("");
+}
+
+/**
+ * Line ending of the line containing `offset`: its own LF or CRLF, or that of the line before
+ * for an unterminated last line. A lone CR only counts in files without any LF (classic Mac
+ * line endings); elsewhere it is more likely a control character inside a line.
+ */
+function getLineEndingAt(content: string, offset: number): "\r\n" | "\n" | "\r" {
+	let lineFeed = content.indexOf("\n", offset);
+	if (lineFeed === -1) lineFeed = content.lastIndexOf("\n", offset);
+	if (lineFeed === -1) return content.includes("\r") ? "\r" : "\n";
+	return content[lineFeed - 1] === "\r" ? "\r\n" : "\n";
 }
 
 /**
@@ -70,7 +113,8 @@ interface MatchedEdit {
 	newText: string;
 }
 
-type TextReplacement = Pick<MatchedEdit, "matchIndex" | "matchLength" | "newText">;
+/** Replacement of `matchLength` characters at `matchIndex` with `newText`. */
+export type TextReplacement = Pick<MatchedEdit, "matchIndex" | "matchLength" | "newText">;
 
 function getLineSpans(content: string): LineSpan[] {
 	let offset = 0;
@@ -120,21 +164,21 @@ function applyReplacements(content: string, replacements: TextReplacement[], off
 }
 
 /**
- * Apply replacements matched against `baseContent` to `originalContent` while
- * preserving unchanged line blocks from the original.
+ * Turn replacements matched against `baseContent` into replacements of
+ * `originalContent` that keep unchanged line blocks from the original.
  *
  * This is useful when `baseContent` is a normalized view of the original. Each
- * replacement is widened to the lines it actually touches, those touched lines
- * are rewritten from the normalized base, and all other lines are copied back
- * from `originalContent`. The actual replacement ranges drive preservation so
+ * replacement is widened to the lines it actually touches, and those touched
+ * lines are rewritten from the normalized base; all other lines keep their
+ * original text. The actual replacement ranges drive preservation so
  * duplicate normalized lines cannot be aligned to the wrong occurrence.
  */
-export function applyReplacementsPreservingUnchangedLines(
+function widenReplacementsToLines(
 	originalContent: string,
 	baseContent: string,
 	replacements: TextReplacement[],
-): string {
-	const originalLines = splitLinesWithEndings(originalContent);
+): TextReplacement[] {
+	const originalLines = getLineSpans(originalContent);
 	const baseLines = getLineSpans(baseContent);
 	if (originalLines.length !== baseLines.length) {
 		throw new Error("Cannot preserve unchanged lines because the base content has a different line count.");
@@ -153,23 +197,20 @@ export function applyReplacementsPreservingUnchangedLines(
 		groups.push({ ...range, replacements: [replacement] });
 	}
 
-	let originalLineIndex = 0;
-	let result = "";
-	for (const group of groups) {
-		result += originalLines.slice(originalLineIndex, group.startLine).join("");
-
+	return groups.map((group) => {
 		const groupStartOffset = baseLines[group.startLine].start;
 		const groupEndOffset = baseLines[group.endLine - 1].end;
-		result += applyReplacements(
-			baseContent.slice(groupStartOffset, groupEndOffset),
-			group.replacements,
-			groupStartOffset,
-		);
-		originalLineIndex = group.endLine;
-	}
-	result += originalLines.slice(originalLineIndex).join("");
-
-	return result;
+		const originalStart = originalLines[group.startLine].start;
+		return {
+			matchIndex: originalStart,
+			matchLength: originalLines[group.endLine - 1].end - originalStart,
+			newText: applyReplacements(
+				baseContent.slice(groupStartOffset, groupEndOffset),
+				group.replacements,
+				groupStartOffset,
+			),
+		};
+	});
 }
 
 export interface FuzzyMatchResult {
@@ -196,6 +237,8 @@ export interface Edit {
 export interface AppliedEditsResult {
 	baseContent: string;
 	newContent: string;
+	/** Sorted replacements of `baseContent` that turn it into `newContent` */
+	replacements: TextReplacement[];
 }
 
 /**
@@ -350,16 +393,27 @@ export function applyEditsToNormalizedContent(
 	}
 
 	const baseContent = normalizedContent;
-	const newContent = usedFuzzyMatch
-		? applyReplacementsPreservingUnchangedLines(normalizedContent, replacementBaseContent, matchedEdits)
-		: applyReplacements(replacementBaseContent, matchedEdits);
+	const replacements = usedFuzzyMatch
+		? widenReplacementsToLines(normalizedContent, replacementBaseContent, matchedEdits)
+		: matchedEdits;
+	const newContent = applyReplacements(baseContent, replacements);
 
 	if (baseContent === newContent) {
 		throw getNoChangeError(path, normalizedEdits.length);
 	}
 
-	return { baseContent, newContent };
+	return { baseContent, newContent, replacements };
 }
+
+/**
+ * File size above which edit results and previews show a notice instead of a diff. Diffing
+ * the whole file takes roughly 10 to 15 times its size in heap (about 50 MB at this limit),
+ * so larger files could run out of memory; source files are far below it.
+ */
+export const EDIT_DIFF_MAX_FILE_BYTES = 5 * 1024 * 1024;
+
+/** Shown instead of the diff of a file larger than `EDIT_DIFF_MAX_FILE_BYTES`. */
+export const EDIT_DIFF_OMITTED_NOTICE = "Diff not shown: the file is larger than 5 MB.";
 
 /** Generate a standard unified patch. */
 export function generateUnifiedPatch(path: string, oldContent: string, newContent: string, contextLines = 4): string {
@@ -528,7 +582,8 @@ export async function computeEditsDiff(
 		}
 
 		// Read the file
-		const rawContent = await readFile(absolutePath, "utf-8");
+		const buffer = await readFile(absolutePath);
+		const rawContent = buffer.toString("utf-8");
 
 		// Strip BOM before matching (LLM won't include invisible BOM in oldText)
 		const { text: content } = splitBom(rawContent);
@@ -536,6 +591,9 @@ export async function computeEditsDiff(
 		const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
 
 		// Generate the diff
+		if (buffer.length > EDIT_DIFF_MAX_FILE_BYTES) {
+			return { diff: EDIT_DIFF_OMITTED_NOTICE, firstChangedLine: undefined };
+		}
 		return generateDiffString(baseContent, newContent);
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err) };

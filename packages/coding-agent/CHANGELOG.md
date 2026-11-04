@@ -30,6 +30,7 @@
 - Fixed the find tool reporting the result limit when exactly `limit` files match, and `limit: 0` in find and ls returning every result or an empty listing; limits below 1 now mean 1 ([#7121](https://github.com/earendil-works/pi/issues/7121))
 - Fixed grep match lines, codemode output, compaction summaries of tool results, and MCP error and server summaries cutting an emoji or other non-BMP character in half when truncating, which left an invalid lone surrogate in the text ([#7121](https://github.com/earendil-works/pi/issues/7121))
 - Fixed the read tool loading whole files into memory, which ran out of memory on large files even with `offset`/`limit`; it now streams the file and keeps only the shown lines. Custom `ReadOperations` can stream too by providing the new optional `createReadStream` ([#9654](https://github.com/earendil-works/pi/issues/9654))
+- Fixed the edit tool rewriting the line endings of untouched lines in files with mixed CRLF/LF or lone CR line endings, and running out of memory on large files after the file was already written; the diff is now computed before writing, and files larger than 5 MB show a notice instead of a diff ([#8544](https://github.com/earendil-works/pi/issues/8544))
 
 
 ## [1.5.0] - 2026-11-02
